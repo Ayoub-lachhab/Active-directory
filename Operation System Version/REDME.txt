@@ -1,0 +1,4 @@
+This script retrieves the operating system version of all domain computers and exports the results to a CSV file.
+
+
+Use PowerShell in Administrator mode and modify the CSV path if needed.
