@@ -1,3 +1,0 @@
-Get the last logon of computers. You can adjust the number of days based on your needs; the default is 90 days.
-
-Change the CSV path to your own if needed.
