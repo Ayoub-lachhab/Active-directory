@@ -1,358 +1,284 @@
-
 #requires -Modules ActiveDirectory
 <#
 .SYNOPSIS
-    Read-only security audit of Domain Admin accounts.
+    Read-only security audit of effective Domain Admin user accounts.
 .DESCRIPTION
-    Audits effective members of the Domain Admins group.
-    Exports CSV and HTML reports. Makes no AD changes.
+    Audits user accounts returned as recursive members of the Domain Admins
+    group. Exports CSV and HTML reports. Does not modify Active Directory.
+.NOTES
+    Run from a domain-joined computer with the ActiveDirectory PowerShell
+    module and permission to read the relevant AD attributes.
+    LastLogonDate is based on replicated lastLogonTimestamp and is approximate.
+    MFA status is not verified by this on-premises AD script.
 #>
 
 [CmdletBinding()]
 param(
-    [string]$OutputPath = ".\DomainAdmin-Audit-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+    [string]$OutputPath = (Join-Path $PSScriptRoot ("Reports\{0}" -f (Get-Date -Format 'yyyyMMdd-HHmmss')))
 )
 
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
 Import-Module ActiveDirectory -ErrorAction Stop
-
-$ErrorActionPreference = "Stop"
-
 New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
 
-$Domain = Get-ADDomain
-$DomainDN = $Domain.DistinguishedName
+$domain = Get-ADDomain
+$domainAdminsSid = '{0}-512' -f $domain.DomainSID.Value
+$protectedUsersSid = '{0}-525' -f $domain.DomainSID.Value
 
-Write-Host "Starting Domain Admin Security Audit..." -ForegroundColor Cyan
-Write-Host "Domain: $($Domain.DNSRoot)" -ForegroundColor Gray
+Write-Host "Domain Admin Security Audit" -ForegroundColor Cyan
+Write-Host "Domain: $($domain.DNSRoot)"
 
-# Find Domain Admins group using its well-known RID 512
-$DomainAdminsSID = "$($Domain.DomainSID.Value)-512"
+$members = @(
+    Get-ADGroupMember -Identity $domainAdminsSid -Recursive |
+        Where-Object { $_.objectClass -eq 'user' }
+)
 
-$DomainAdminsGroup = Get-ADGroup -Identity $DomainAdminsSID
-
-# Retrieve direct and nested members
-$Members = Get-ADGroupMember -Identity $DomainAdminsGroup -Recursive |
-    Where-Object { $_.objectClass -eq "user" }
-
-# Protected Users group (SID well-known RID 525)
-$ProtectedUsersSID = "$($Domain.DomainSID.Value)-525"
-$ProtectedUsers = @()
-
+$protectedUserSids = @()
 try {
-    $ProtectedUsers = Get-ADGroupMember -Identity $ProtectedUsersSID -Recursive |
-        Where-Object { $_.objectClass -eq "user" } |
-        Select-Object -ExpandProperty SID
+    $protectedUserSids = @(
+        Get-ADGroupMember -Identity $protectedUsersSid -Recursive |
+            Where-Object { $_.objectClass -eq 'user' } |
+            ForEach-Object { $_.SID.Value }
+    )
 }
 catch {
-    Write-Warning "Could not read Protected Users membership."
+    Write-Warning "Could not read Protected Users membership: $($_.Exception.Message)"
 }
 
-$ProtectedSIDList = @($ProtectedUsers | ForEach-Object { $_.Value })
-
-$Results = foreach ($Member in $Members) {
-
+$results = foreach ($member in $members) {
     try {
-        $User = Get-ADUser -Identity $Member.DistinguishedName -Properties `
-            Enabled,LockedOut,LastLogonDate,PasswordLastSet,PasswordNeverExpires, `
-            PasswordNotRequired,PasswordExpired,AccountExpirationDate, `
-            adminCount,ServicePrincipalName,TrustedForDelegation, `
-            TrustedToAuthForDelegation,AllowedToDelegateTo, `
-            DoesNotRequirePreAuth,SmartcardLogonRequired, `
-            msDS-SupportedEncryptionTypes,msDS-UserPasswordExpiryTimeComputed, `
-            whenCreated,whenChanged,Description,Department,Title,Manager, `
-            SID,UserAccountControl
-
-        $Issues = [System.Collections.Generic.List[string]]::new()
-        $Recommendations = [System.Collections.Generic.List[string]]::new()
-
-        # Account status
-        if (-not $User.Enabled) {
-            $Issues.Add("Account disabled but still member of Domain Admins")
-            $Recommendations.Add("Review and remove unnecessary privileged membership")
-        }
-
-        if ($User.LockedOut) {
-            $Issues.Add("Account is locked out")
-        }
-
-        # Password checks
-        if ($User.PasswordNeverExpires) {
-            $Issues.Add("PasswordNeverExpires enabled")
-            $Recommendations.Add("Apply an appropriate password rotation policy")
-        }
-
-        if ($User.PasswordNotRequired) {
-            $Issues.Add("PasswordNotRequired enabled")
-            $Recommendations.Add("Require a password for this account")
-        }
-
-        if ($User.PasswordExpired) {
-            $Issues.Add("Password is expired")
-        }
-
-        if (-not $User.PasswordLastSet) {
-            $Issues.Add("Password last-set date unavailable")
-        }
-        elseif ($User.PasswordLastSet -lt (Get-Date).AddDays(-180)) {
-            $Issues.Add("Password not changed for more than 180 days")
-            $Recommendations.Add("Review password age and authentication policy")
-        }
-
-        # Password expiration timestamp
-        $PasswordExpiry = $null
-        if ($User.'msDS-UserPasswordExpiryTimeComputed' -and
-            $User.'msDS-UserPasswordExpiryTimeComputed' -lt [Int64]::MaxValue) {
-
-            try {
-                $PasswordExpiry = [DateTime]::FromFileTime(
-                    [Int64]$User.'msDS-UserPasswordExpiryTimeComputed'
-                )
-            }
-            catch {}
-        }
-
-        # Last logon checks (replicated timestamp, may lag)
-        $DaysSinceLogon = $null
-
-        if ($User.LastLogonDate) {
-            $DaysSinceLogon = [math]::Floor(
-                ((Get-Date) - $User.LastLogonDate).TotalDays
-            )
-
-            if ($DaysSinceLogon -gt 90) {
-                $Issues.Add("No recorded logon for more than 90 days")
-                $Recommendations.Add("Validate account ownership and business need")
-            }
-        }
-        else {
-            $Issues.Add("No replicated last-logon timestamp available")
-        }
-
-        # Delegation checks
-        if ($User.TrustedForDelegation) {
-            $Issues.Add("Unconstrained Kerberos delegation enabled")
-            $Recommendations.Add("Review and disable unconstrained delegation if unnecessary")
-        }
-
-        if ($User.TrustedToAuthForDelegation) {
-            $Issues.Add("Protocol transition delegation enabled")
-            $Recommendations.Add("Review constrained delegation configuration")
-        }
-
-        if ($User.AllowedToDelegateTo) {
-            $Issues.Add("Kerberos delegation targets configured")
-        }
-
-        # Kerberos checks
-        if ($User.DoesNotRequirePreAuth) {
-            $Issues.Add("Kerberos pre-authentication disabled")
-            $Recommendations.Add("Enable Kerberos pre-authentication")
-        }
-
-        $EncryptionTypes = $User.'msDS-SupportedEncryptionTypes'
-        $AESConfigured = $false
-
-        if ($null -ne $EncryptionTypes) {
-            # AES128 = 0x08, AES256 = 0x10
-            $AESConfigured = (($EncryptionTypes -band 0x18) -ne 0)
-        }
-
-        if ($null -eq $EncryptionTypes -or $EncryptionTypes -eq 0) {
-            $Issues.Add("Kerberos encryption types not explicitly configured")
-        }
-        elseif (-not $AESConfigured) {
-            $Issues.Add("AES Kerberos encryption not configured")
-            $Recommendations.Add("Review Kerberos encryption compatibility and enable AES")
-        }
-
-        # SPN check
-        $HasSPN = @($User.ServicePrincipalName).Count -gt 0
-
-        if ($HasSPN) {
-            $Issues.Add("Privileged account has Service Principal Names")
-            $Recommendations.Add("Review SPNs and consider a dedicated service identity")
-        }
-
-        # Privileged account protections
-        $IsProtectedUser = $ProtectedSIDList -contains $User.SID.Value
-
-        if (-not $IsProtectedUser) {
-            $Issues.Add("Not a member of Protected Users group")
-            $Recommendations.Add("Evaluate Protected Users group compatibility")
-        }
-
-        if ($User.SmartcardLogonRequired) {
-            $SmartcardStatus = "Required"
-        }
-        else {
-            $SmartcardStatus = "Not required"
-            $Issues.Add("Smart card logon not required")
-            $Recommendations.Add("Consider stronger authentication for privileged accounts")
-        }
-
-        if ($User.adminCount -ne 1) {
-            $Issues.Add("adminCount is not 1 - review protected account status")
-        }
-
-        # Account age
-        $AccountAgeDays = [math]::Floor(
-            ((Get-Date) - $User.whenCreated).TotalDays
+        $user = Get-ADUser -Identity $member.DistinguishedName -Properties @(
+            'Enabled', 'LockedOut', 'LastLogonDate', 'PasswordLastSet',
+            'PasswordNeverExpires', 'PasswordNotRequired', 'PasswordExpired',
+            'AccountExpirationDate', 'adminCount', 'ServicePrincipalName',
+            'TrustedForDelegation', 'TrustedToAuthForDelegation',
+            'AllowedToDelegateTo', 'DoesNotRequirePreAuth',
+            'SmartcardLogonRequired', 'msDS-SupportedEncryptionTypes',
+            'msDS-UserPasswordExpiryTimeComputed', 'whenCreated', 'whenChanged',
+            'Description', 'Department', 'Title', 'Manager', 'SID'
         )
 
-        # Result
-        $IssueCount = $Issues.Count
+        $issues = [System.Collections.Generic.List[string]]::new()
+        $recommendations = [System.Collections.Generic.List[string]]::new()
 
-        if ($IssueCount -eq 0) {
-            $Risk = "Low"
+        if (-not $user.Enabled) {
+            $issues.Add('Account is disabled but remains in Domain Admins')
+            $recommendations.Add('Review and remove privileged membership if no longer required')
         }
-        elseif ($IssueCount -le 2) {
-            $Risk = "Medium"
+        if ($user.LockedOut) {
+            $issues.Add('Account is currently locked out')
+            $recommendations.Add('Investigate the lockout source')
+        }
+        if ($user.PasswordNeverExpires) {
+            $issues.Add('PasswordNeverExpires is enabled')
+            $recommendations.Add('Review password policy and privileged-account controls')
+        }
+        if ($user.PasswordNotRequired) {
+            $issues.Add('PasswordNotRequired is enabled')
+            $recommendations.Add('Require a password for this account')
+        }
+        if ($user.PasswordExpired) {
+            $issues.Add('Password is expired')
+            $recommendations.Add('Verify the account owner and remediate the expired credential')
+        }
+
+        if ($null -eq $user.PasswordLastSet) {
+            $issues.Add('Password last-set timestamp is unavailable')
+        }
+        elseif ($user.PasswordLastSet -lt (Get-Date).AddDays(-180)) {
+            $issues.Add('Password has not been changed for more than 180 days')
+            $recommendations.Add('Review credential age against the organisation policy')
+        }
+
+        $passwordExpiry = $null
+        $expiryFileTime = $user.'msDS-UserPasswordExpiryTimeComputed'
+        if ($null -ne $expiryFileTime -and [Int64]$expiryFileTime -gt 0 -and
+            [Int64]$expiryFileTime -lt [Int64]::MaxValue) {
+            try { $passwordExpiry = [DateTime]::FromFileTime([Int64]$expiryFileTime) } catch {}
+        }
+
+        $daysSinceLogon = $null
+        if ($user.LastLogonDate) {
+            $daysSinceLogon = [int][math]::Floor(((Get-Date) - $user.LastLogonDate).TotalDays)
+            if ($daysSinceLogon -gt 90) {
+                $issues.Add('No replicated logon timestamp for more than 90 days')
+                $recommendations.Add('Confirm account ownership and business need')
+            }
         }
         else {
-            $Risk = "High"
+            $issues.Add('No replicated last-logon timestamp is available')
+            $recommendations.Add('Check logon activity on domain controllers before taking action')
         }
 
+        if ($user.TrustedForDelegation) {
+            $issues.Add('Unconstrained Kerberos delegation is enabled')
+            $recommendations.Add('Review and remove unconstrained delegation where not essential')
+        }
+        if ($user.TrustedToAuthForDelegation) {
+            $issues.Add('Protocol transition delegation is enabled')
+            $recommendations.Add('Review the delegation configuration and business justification')
+        }
+        if (@($user.AllowedToDelegateTo).Count -gt 0) {
+            $issues.Add('Kerberos delegation targets are configured')
+            $recommendations.Add('Review each configured delegation target')
+        }
+
+        if ($user.DoesNotRequirePreAuth) {
+            $issues.Add('Kerberos pre-authentication is disabled')
+            $recommendations.Add('Enable Kerberos pre-authentication unless a documented exception exists')
+        }
+
+        $encryptionTypes = $user.'msDS-SupportedEncryptionTypes'
+        $aesConfigured = $null
+        if ($null -ne $encryptionTypes -and [int]$encryptionTypes -ne 0) {
+            $aesConfigured = (([int]$encryptionTypes -band 0x18) -ne 0)
+            if (-not $aesConfigured) {
+                $issues.Add('AES Kerberos encryption flags are not present on the account')
+                $recommendations.Add('Review Kerberos encryption compatibility before enabling AES')
+            }
+        }
+
+        $hasSpn = @($user.ServicePrincipalName).Count -gt 0
+        if ($hasSpn) {
+            $issues.Add('Privileged user account has one or more SPNs')
+            $recommendations.Add('Review SPNs; use a dedicated service identity where appropriate')
+        }
+
+        $isProtectedUser = $protectedUserSids -contains $user.SID.Value
+        if (-not $isProtectedUser) {
+            $issues.Add('Account is not a member of Protected Users')
+            $recommendations.Add('Evaluate Protected Users compatibility; membership is not suitable for every account')
+        }
+
+        $smartcardStatus = if ($user.SmartcardLogonRequired) { 'Required' } else { 'Not required' }
+        if (-not $user.SmartcardLogonRequired) {
+            $issues.Add('Smart-card logon is not required')
+            $recommendations.Add('Consider phishing-resistant authentication for privileged access')
+        }
+
+        if ($user.adminCount -ne 1) {
+            $issues.Add('adminCount is not 1')
+            $recommendations.Add('Review AdminSDHolder/protected-group status; this attribute alone is not conclusive')
+        }
+
+        $issueCount = $issues.Count
+        $risk = if ($issueCount -ge 5) { 'High' } elseif ($issueCount -ge 2) { 'Medium' } else { 'Low' }
+
         [PSCustomObject]@{
-            Name                    = $User.Name
-            SamAccountName          = $User.SamAccountName
-            Enabled                 = $User.Enabled
-            LockedOut               = $User.LockedOut
-            RiskLevel               = $Risk
-            IssueCount              = $IssueCount
-            SecurityIssues          = ($Issues -join " | ")
-            Recommendations         = ($Recommendations -join " | ")
-            LastLogon               = $User.LastLogonDate
-            DaysSinceLastLogon      = $DaysSinceLogon
-            PasswordLastSet         = $User.PasswordLastSet
-            PasswordExpiry          = $PasswordExpiry
-            PasswordNeverExpires    = $User.PasswordNeverExpires
-            PasswordNotRequired     = $User.PasswordNotRequired
-            PasswordExpired         = $User.PasswordExpired
-            AccountExpirationDate   = $User.AccountExpirationDate
-            SmartcardRequired       = $SmartcardStatus
-            ProtectedUsersMember    = $IsProtectedUser
-            HasSPN                  = $HasSPN
-            SPNs                    = ($User.ServicePrincipalName -join "; ")
-            UnconstrainedDelegation = $User.TrustedForDelegation
-            ProtocolTransition      = $User.TrustedToAuthForDelegation
-            DelegationTargets       = ($User.AllowedToDelegateTo -join "; ")
-            KerberosPreAuthDisabled = $User.DoesNotRequirePreAuth
-            KerberosEncryptionTypes = $EncryptionTypes
-            AESConfigured           = $AESConfigured
-            AdminCount              = $User.adminCount
-            AccountAgeDays          = $AccountAgeDays
-            Department              = $User.Department
-            Title                   = $User.Title
-            Description             = $User.Description
-            Manager                 = $User.Manager
-            Created                 = $User.whenCreated
-            Modified                = $User.whenChanged
-            DistinguishedName      = $User.DistinguishedName
+            Name                    = $user.Name
+            SamAccountName          = $user.SamAccountName
+            Enabled                 = $user.Enabled
+            LockedOut               = $user.LockedOut
+            RiskLevel               = $risk
+            IssueCount              = $issueCount
+            SecurityIssues          = ($issues -join ' | ')
+            Recommendations         = ($recommendations -join ' | ')
+            LastLogon               = $user.LastLogonDate
+            DaysSinceLastLogon      = $daysSinceLogon
+            PasswordLastSet         = $user.PasswordLastSet
+            PasswordExpiry          = $passwordExpiry
+            PasswordNeverExpires    = $user.PasswordNeverExpires
+            PasswordNotRequired     = $user.PasswordNotRequired
+            PasswordExpired         = $user.PasswordExpired
+            AccountExpirationDate   = $user.AccountExpirationDate
+            SmartcardRequired       = $smartcardStatus
+            ProtectedUsersMember    = $isProtectedUser
+            HasSPN                  = $hasSpn
+            SPNs                    = (@($user.ServicePrincipalName) -join '; ')
+            UnconstrainedDelegation = $user.TrustedForDelegation
+            ProtocolTransition      = $user.TrustedToAuthForDelegation
+            DelegationTargets       = (@($user.AllowedToDelegateTo) -join '; ')
+            KerberosPreAuthDisabled = $user.DoesNotRequirePreAuth
+            KerberosEncryptionTypes = $encryptionTypes
+            AESConfigured           = $aesConfigured
+            AdminCount              = $user.adminCount
+            AccountAgeDays          = [int][math]::Floor(((Get-Date) - $user.whenCreated).TotalDays)
+            Department              = $user.Department
+            Title                   = $user.Title
+            Description             = $user.Description
+            Manager                 = $user.Manager
+            Created                 = $user.whenCreated
+            Modified                = $user.whenChanged
+            DistinguishedName      = $user.DistinguishedName
         }
     }
     catch {
-        Write-Warning "Could not audit $($Member.Name): $_"
+        Write-Warning "Could not audit '$($member.Name)': $($_.Exception.Message)"
     }
 }
 
-# Export CSV
-$CsvPath = Join-Path $OutputPath "DomainAdmin-Security-Audit.csv"
-$Results | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
+$csvPath = Join-Path $OutputPath 'DomainAdmin-Security-Audit.csv'
+$htmlPath = Join-Path $OutputPath 'DomainAdmin-Security-Audit.html'
 
-# Summary
-$Total = @($Results).Count
-$High = @($Results | Where-Object RiskLevel -eq "High").Count
-$Medium = @($Results | Where-Object RiskLevel -eq "Medium").Count
-$Low = @($Results | Where-Object RiskLevel -eq "Low").Count
+$results | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
 
-# HTML report
-$HtmlPath = Join-Path $OutputPath "DomainAdmin-Security-Audit.html"
+$total = @($results).Count
+$high = @($results | Where-Object RiskLevel -eq 'High').Count
+$medium = @($results | Where-Object RiskLevel -eq 'Medium').Count
+$low = @($results | Where-Object RiskLevel -eq 'Low').Count
 
-$Rows = $Results | ForEach-Object {
-    $Color = switch ($_.RiskLevel) {
-        "High"   { "#f8d7da" }
-        "Medium" { "#fff3cd" }
-        default  { "#d1e7dd" }
+$rows = foreach ($item in $results) {
+    $background = switch ($item.RiskLevel) {
+        'High'   { '#f8d7da' }
+        'Medium' { '#fff3cd' }
+        default  { '#d1e7dd' }
     }
+    $name = [System.Net.WebUtility]::HtmlEncode([string]$item.Name)
+    $login = [System.Net.WebUtility]::HtmlEncode([string]$item.SamAccountName)
+    $issuesText = [System.Net.WebUtility]::HtmlEncode([string]$item.SecurityIssues)
+    $recommendationsText = [System.Net.WebUtility]::HtmlEncode([string]$item.Recommendations)
 
-    $Name = [System.Net.WebUtility]::HtmlEncode($_.Name)
-    $Login = [System.Net.WebUtility]::HtmlEncode($_.SamAccountName)
-    $Issues = [System.Net.WebUtility]::HtmlEncode($_.SecurityIssues)
-    $Recommendations = [System.Net.WebUtility]::HtmlEncode($_.Recommendations)
-
-    "<tr style='background:$Color'>
-        <td>$Name</td>
-        <td>$Login</td>
-        <td>$($_.Enabled)</td>
-        <td><b>$($_.RiskLevel)</b></td>
-        <td>$($_.IssueCount)</td>
-        <td>$Issues</td>
-        <td>$Recommendations</td>
-    </tr>"
+    "<tr style='background:$background'><td>$name</td><td>$login</td><td>$($item.Enabled)</td><td><b>$($item.RiskLevel)</b></td><td>$($item.IssueCount)</td><td>$issuesText</td><td>$recommendationsText</td></tr>"
 }
 
-$Generated = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-
-$Html = @"
+$generated = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+$html = @"
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Domain Admin Security Audit</title>
 <style>
-body { font-family: Arial; margin: 30px; background: #f4f6f9; color: #222; }
-h1 { color: #172b4d; }
-.cards { display: flex; gap: 15px; margin: 20px 0; }
-.card { background: white; padding: 18px; border-radius: 8px; min-width: 120px; }
-table { border-collapse: collapse; width: 100%; background: white; }
-th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
-th { background: #172b4d; color: white; }
-.small { color: #666; font-size: 12px; }
+body{font-family:Arial,sans-serif;margin:28px;background:#f4f6f9;color:#202938}
+h1{color:#172b4d}.cards{display:flex;flex-wrap:wrap;gap:14px;margin:20px 0}
+.card{background:#fff;padding:16px 22px;border-radius:8px;min-width:110px;box-shadow:0 1px 4px #0001}
+.card h2{margin:8px 0 0}table{border-collapse:collapse;width:100%;background:#fff}
+th,td{border:1px solid #ddd;padding:9px;text-align:left;vertical-align:top}
+th{background:#172b4d;color:#fff} .note{color:#5c6675;font-size:12px;margin-top:20px}
 </style>
 </head>
 <body>
 <h1>Domain Admin Security Audit</h1>
-<p><b>Domain:</b> $($Domain.DNSRoot)</p>
-<p><b>Generated:</b> $Generated</p>
-
+<p><b>Domain:</b> $([System.Net.WebUtility]::HtmlEncode($domain.DNSRoot))</p>
+<p><b>Generated:</b> $generated</p>
 <div class="cards">
-<div class="card"><b>Total accounts</b><h2>$Total</h2></div>
-<div class="card"><b>High risk</b><h2>$High</h2></div>
-<div class="card"><b>Medium risk</b><h2>$Medium</h2></div>
-<div class="card"><b>Low risk</b><h2>$Low</h2></div>
+<div class="card"><b>Total accounts</b><h2>$total</h2></div>
+<div class="card"><b>High risk</b><h2>$high</h2></div>
+<div class="card"><b>Medium risk</b><h2>$medium</h2></div>
+<div class="card"><b>Low risk</b><h2>$low</h2></div>
 </div>
-
 <table>
-<thead>
-<tr>
-<th>Name</th><th>Login</th><th>Enabled</th><th>Risk</th>
-<th>Issues</th><th>Security findings</th><th>Recommendations</th>
-</tr>
-</thead>
+<thead><tr><th>Name</th><th>Login</th><th>Enabled</th><th>Risk</th><th>Findings</th><th>Security findings</th><th>Recommendations</th></tr></thead>
 <tbody>
-$($Rows -join "`n")
+$($rows -join "`n")
 </tbody>
 </table>
-
-<p class="small">
-Read-only audit. LastLogonDate uses the replicated lastLogonTimestamp
-and may not reflect the exact last logon time. Risk levels are indicative
-and require administrator review. MFA status is not verified by this
-on-premises Active Directory audit.
-</p>
+<p class="note">Read-only report. LastLogonDate uses replicated lastLogonTimestamp and may lag. MFA is not verified by this on-premises Active Directory audit. Risk levels are indicative and require administrator review. Protected Users and smart-card recommendations must be checked for compatibility with your environment.</p>
 </body>
 </html>
 "@
 
-$Html | Out-File -FilePath $HtmlPath -Encoding UTF8
+$html | Out-File -FilePath $htmlPath -Encoding UTF8
 
 Write-Host "`n========== AUDIT SUMMARY ==========" -ForegroundColor Cyan
-Write-Host "Domain: $($Domain.DNSRoot)"
-Write-Host "Total accounts: $Total"
-Write-Host "High risk: $High" -ForegroundColor Red
-Write-Host "Medium risk: $Medium" -ForegroundColor Yellow
-Write-Host "Low risk: $Low" -ForegroundColor Green
+Write-Host "Domain: $($domain.DNSRoot)"
+Write-Host "Total accounts: $total"
+Write-Host "High risk: $high" -ForegroundColor Red
+Write-Host "Medium risk: $medium" -ForegroundColor Yellow
+Write-Host "Low risk: $low" -ForegroundColor Green
 Write-Host "`nReports generated:"
-Write-Host $CsvPath -ForegroundColor Green
-Write-Host $HtmlPath -ForegroundColor Green
-
+Write-Host $csvPath -ForegroundColor Green
+Write-Host $htmlPath -ForegroundColor Green
